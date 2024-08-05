@@ -35,6 +35,8 @@
 
 #include <cmath>
 #include <string>
+#include <algorithm>
+#include <vector>
 
 #include "depthimage_to_laserscan/DepthImageToLaserScan_export.h"
 #include "depthimage_to_laserscan/depth_traits.hpp"
@@ -71,13 +73,19 @@ public:
    *                    a single LaserScan.
    * @param scan_offset Center position of the LaserScan. A value of 0.0 corresponds to the top row of the image
    *                    while 1.0 corresponds to the bottom row of the image.
+   * @param quantile_value The quantile value to use for calculating the distance for each column.
+   *                       This value determines which distance measurement to use from the multiple
+   *                       rows of depth data. For example, a quantile value of 0.1 will use the 10th
+   *                       percentile distance, providing a balance between ignoring outliers and
+   *                       maintaining accurate distance measurements. This helps in reducing noise
+   *                       and improving the stability of the laser scan data.
    * @param frame_id The output frame_id for the LaserScan.  This will probably NOT be the same frame_id as the
    *                 depth image.  Example: For OpenNI cameras, this should be set to 'camera_depth_frame' while
    *                 the camera uses 'camera_depth_optical_frame'.
    *
    */
   explicit DepthImageToLaserScan(
-    float scan_time, float range_min, float range_max, int scan_height, float scan_offset,
+    float scan_time, float range_min, float range_max, int scan_height, float scan_offset, float quantile_value,
     const std::string & frame_id);
 
   ~DepthImageToLaserScan();
@@ -152,6 +160,7 @@ private:
    * @param scan_msg The output LaserScan.
    * @param scan_height The number of vertical pixels to feed into each angular_measurement.
    * @param scan_offset Height ratio of the image where the center of the scan line should be (0.0=top row, 1.0=bottom row).
+   * @param quantile_value The quantile value to use for calculating the distance for each column.
    *
    */
   template<typename T>
@@ -160,7 +169,8 @@ private:
     const image_geometry::PinholeCameraModel & cam_model,
     const sensor_msgs::msg::LaserScan::UniquePtr & scan_msg,
     const int & scan_height,
-    const float & scan_offset) const
+    const float & scan_offset,
+    const float & quantile_value) const
   {
     // Use correct principal point from calibration
     float center_x = cam_model.cx();
@@ -169,37 +179,56 @@ private:
     double unit_scaling = depthimage_to_laserscan::DepthTraits<T>::toMeters(T(1));
     float constant_x = unit_scaling / cam_model.fx();
 
-    const T * depth_row = reinterpret_cast<const T *>(&depth_msg->data[0]);
     int row_step = depth_msg->step / sizeof(T);
 
     int offset = static_cast<int>((cam_model.cy() * 2 * scan_offset) -
       static_cast<double>(scan_height) / 2.0);
-    depth_row += offset * row_step;  // Offset to center of image
-    for (int v = offset; v < offset + scan_height_; v++, depth_row += row_step) {
+
+    std::vector<std::vector<double>> column_distances(depth_msg->width);
+
+    // Collect distances for each column
+    for (int v = offset; v < offset + scan_height; v++) {
+      const T * depth_row = reinterpret_cast<const T *>(&depth_msg->data[0]) + v * row_step;
       for (uint32_t u = 0; u < depth_msg->width; u++) {  // Loop over each pixel in row
         T depth = depth_row[u];
 
         double r = depth;  // Assign to pass through NaNs and Infs
-        // Atan2(x, z), but depth divides out
-        double th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
-        int index = (th - scan_msg->angle_min) / scan_msg->angle_increment;
-
         if (depthimage_to_laserscan::DepthTraits<T>::valid(depth)) {  // Not NaN or Inf
-          // Calculate in XYZ
           double x = (u - center_x) * depth * constant_x;
           double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
-
-          // Calculate actual distance
           r = std::sqrt(std::pow(x, 2.0) + std::pow(z, 2.0));
         }
 
-        // Determine if this point should be used.
+        double th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
+        int index = (th - scan_msg->angle_min) / scan_msg->angle_increment;
+
         if (use_point(r, scan_msg->ranges[index], scan_msg->range_min, scan_msg->range_max)) {
-          scan_msg->ranges[index] = r;
+          column_distances[u].push_back(r);
+        }
+      }
+    }
+
+    // Compute quantile for each column and update scan ranges
+    for (uint32_t u = 0; u < depth_msg->width; u++) {
+      if (!column_distances[u].empty()) {
+        std::sort(column_distances[u].begin(), column_distances[u].end());
+        size_t index = static_cast<size_t>(quantile_value * column_distances[u].size());
+        double quantile_distance = column_distances[u][index];
+
+        double th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
+        int scan_index = (th - scan_msg->angle_min) / scan_msg->angle_increment;
+
+        // Update scan range
+        if (use_point(
+            quantile_distance, scan_msg->ranges[scan_index], scan_msg->range_min,
+            scan_msg->range_max))
+        {
+          scan_msg->ranges[scan_index] = quantile_distance;
         }
       }
     }
   }
+
 
   ///< image_geometry helper class for managing sensor_msgs/CameraInfo messages.
   image_geometry::PinholeCameraModel cam_model_;
@@ -211,6 +240,7 @@ private:
   ///< Height ratio of the image where the center of the scan line should be.
   // (0.0=top row, 1.0=bottom row).
   float scan_offset_;
+  float quantile_value_;  ///< Quantile value to use for calculating the distance for each column.
   ///< Output frame_id for each laserscan.  This is likely NOT the camera's frame_id.
   std::string output_frame_id_;
 };
